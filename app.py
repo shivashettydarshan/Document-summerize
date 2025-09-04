@@ -1,195 +1,244 @@
-import streamlit as st
+from flask import Flask, request, jsonify, render_template, redirect, url_for, session, send_from_directory
+from flask_pymongo import PyMongo
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_cors import CORS
+from bson import ObjectId
+from gtts import gTTS
+from deep_translator import GoogleTranslator
+import pdfplumber
+import docx
+import re
+import spacy
+from werkzeug.utils import secure_filename
 import os
-import tempfile
-from io import BytesIO
-from document_processor import DocumentProcessor
-from ai_summarizer import AISummarizer
-from utils import format_file_size, validate_file_type
+import logging
+import uuid
+from newspaper import Article
 
-# Configure page
-st.set_page_config(
-    page_title="Legal Document Summarizer",
-    page_icon="⚖️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-# Initialize processors
-@st.cache_resource
-def get_processors():
-    doc_processor = DocumentProcessor()
-    ai_summarizer = AISummarizer()
-    return doc_processor, ai_summarizer
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+app.config['MONGO_URI'] = "mongodb://localhost:27017/summary_app"
+app.config['UPLOAD_FOLDER'] = os.path.join(app.root_path, 'static/uploads')
+mongo = PyMongo(app)
+CORS(app)
 
-def main():
-    st.title("⚖️ Legal Document Summarizer")
-    st.markdown("AI-powered legal document analysis and summarization tool")
-    
-    # Sidebar configuration
-    with st.sidebar:
-        st.header("Configuration")
-        
-        # AI Provider selection
-        ai_provider = st.selectbox(
-            "Select AI Provider",
-            ["OpenAI", "Anthropic"],
-            help="Choose your preferred AI service for document summarization"
-        )
-        
-        # Summary length
-        summary_length = st.selectbox(
-            "Summary Length",
-            ["Brief", "Standard", "Detailed"],
-            index=1,
-            help="Choose the desired length of the summary"
-        )
-        
-        # Focus areas
-        st.subheader("Focus Areas")
-        focus_areas = []
-        if st.checkbox("Key Legal Points", value=True):
-            focus_areas.append("key legal points")
-        if st.checkbox("Obligations & Rights"):
-            focus_areas.append("obligations and rights")
-        if st.checkbox("Dates & Deadlines"):
-            focus_areas.append("important dates and deadlines")
-        if st.checkbox("Financial Terms"):
-            focus_areas.append("financial terms and amounts")
-        if st.checkbox("Risk Factors"):
-            focus_areas.append("risk factors")
-    
-    # Main content area
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.header("📄 Document Upload")
-        
-        # File uploader
-        uploaded_file = st.file_uploader(
-            "Upload your legal document",
-            type=["pdf", "txt", "docx"],
-            help="Supported formats: PDF, TXT, DOCX (Max size: 200MB)"
-        )
-        
-        if uploaded_file is not None:
-            # Display file info
-            st.success(f"✅ File uploaded: {uploaded_file.name}")
-            st.info(f"📊 File size: {format_file_size(uploaded_file.size)}")
-            
-            # Validate file type
-            if not validate_file_type(uploaded_file.name):
-                st.error("❌ Unsupported file type. Please upload PDF, TXT, or DOCX files only.")
-                return
-            
-            # Process document button
-            if st.button("🔍 Analyze Document", type="primary"):
-                try:
-                    doc_processor, ai_summarizer = get_processors()
-                    
-                    # Create progress bar
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    # Step 1: Extract text
-                    status_text.text("📖 Extracting text from document...")
-                    progress_bar.progress(25)
-                    
-                    # Save uploaded file temporarily
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        tmp_file_path = tmp_file.name
-                    
-                    try:
-                        # Extract text
-                        extracted_text = doc_processor.extract_text(tmp_file_path, uploaded_file.name)
-                        
-                        if not extracted_text.strip():
-                            st.error("❌ No text could be extracted from the document. Please ensure the document contains readable text.")
-                            return
-                        
-                        progress_bar.progress(50)
-                        
-                        # Step 2: Generate summary
-                        status_text.text("🤖 Generating AI summary...")
-                        progress_bar.progress(75)
-                        
-                        # Create summary prompt based on focus areas
-                        focus_text = ", ".join(focus_areas) if focus_areas else "general legal analysis"
-                        
-                        summary = ai_summarizer.summarize_document(
-                            text=extracted_text,
-                            provider=ai_provider.lower(),
-                            length=summary_length.lower(),
-                            focus_areas=focus_text
-                        )
-                        
-                        progress_bar.progress(100)
-                        status_text.text("✅ Analysis complete!")
-                        
-                        # Store results in session state
-                        st.session_state['original_text'] = extracted_text
-                        st.session_state['summary'] = summary
-                        st.session_state['document_name'] = uploaded_file.name
-                        
-                    finally:
-                        # Clean up temporary file
-                        if os.path.exists(tmp_file_path):
-                            os.unlink(tmp_file_path)
-                        
-                except Exception as e:
-                    st.error(f"❌ Error processing document: {str(e)}")
-                    progress_bar.empty()
-                    status_text.empty()
-    
-    with col2:
-        st.header("📋 Document Summary")
-        
-        # Display summary if available
-        if 'summary' in st.session_state:
-            st.success("✅ Summary generated successfully!")
-            
-            # Summary content
-            st.subheader("AI-Generated Summary")
-            st.markdown(st.session_state['summary'])
-            
-            # Download summary
-            summary_bytes = st.session_state['summary'].encode('utf-8')
-            st.download_button(
-                label="📥 Download Summary",
-                data=summary_bytes,
-                file_name=f"summary_{st.session_state['document_name'].rsplit('.', 1)[0]}.txt",
-                mime="text/plain"
-            )
-            
-            # Word count info
-            summary_words = len(st.session_state['summary'].split())
-            original_words = len(st.session_state['original_text'].split())
-            compression_ratio = (1 - summary_words / original_words) * 100 if original_words > 0 else 0
-            
-            st.info(f"📊 Summary: {summary_words:,} words | Original: {original_words:,} words | Compression: {compression_ratio:.1f}%")
-        else:
-            st.info("👆 Upload a document and click 'Analyze Document' to generate a summary.")
-    
-    # Original document viewer (expandable)
-    if 'original_text' in st.session_state:
-        with st.expander("📖 View Original Document Text", expanded=False):
-            st.text_area(
-                "Original Document Content",
-                value=st.session_state['original_text'],
-                height=400,
-                disabled=True
-            )
-    
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style='text-align: center; color: #666;'>
-            <small>⚖️ Legal Document Summarizer | Powered by AI | For legal professionals</small>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    logger.error("spaCy model 'en_core_web_sm' not found. Please run: python -m spacy download en_core_web_sm")
+    raise
 
-if __name__ == "__main__":
-    main()
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+    logger.info(f"Created upload folder: {app.config['UPLOAD_FOLDER']}")
+
+try:
+    mongo.db.command("ping")
+    logger.info("Connected to MongoDB successfully.")
+except Exception as e:
+    logger.error(f"Failed to connect to MongoDB: {str(e)}")
+    print("Warning: MongoDB connection failed. Ensure MongoDB is running.")
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+@app.route('/')
+def index():
+    try:
+        return redirect(url_for('home' if 'user_id' in session else 'login'))
+    except Exception as e:
+        logger.error(f"Index route error: {str(e)}")
+        return jsonify({"status": "fail", "message": "Unable to load page."}), 500
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    try:
+        if request.method == 'GET':
+            return render_template('register.html')
+        data = request.get_json()
+        if not all([data.get(k, '').strip() for k in ['name', 'email', 'username', 'password']]):
+            return jsonify({"status": "fail", "message": "All fields are required."})
+        if mongo.db.users.find_one({"$or": [{"email": data['email']}, {"username": data['username']}]}):
+            return jsonify({"status": "fail", "message": "Email or username already exists."})
+        hashed_pw = generate_password_hash(data['password'])
+        mongo.db.users.insert_one({k: data[k] for k in ['name', 'email', 'username']} | {"password": hashed_pw})
+        return jsonify({"status": "success", "message": "Registration successful! Redirecting to login..."})
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)} with data: {data}")
+        return jsonify({"status": "fail", "message": "Registration failed."}), 500
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    try:
+        if request.method == 'GET':
+            return render_template('login.html')
+        data = request.get_json()
+        identifier, password = data.get('identifier', '').strip(), data.get('password', '').strip()
+        user = mongo.db.users.find_one({"$or": [{"email": identifier}, {"username": identifier}]})
+        if user and check_password_hash(user['password'], password):
+            session['user_id'] = str(user['_id'])
+            return jsonify({"status": "success", "message": "Login successful! Redirecting to home..."})
+        return jsonify({"status": "fail", "message": "Invalid email/username or password."})
+    except Exception as e:
+        logger.error(f"Login error: {str(e)} with data: {data}")
+        return jsonify({"status": "fail", "message": "Login failed."}), 500
+
+@app.route('/home')
+def home():
+    try:
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        user = mongo.db.users.find_one({"_id": ObjectId(session['user_id'])}, {"password": 0})
+        return render_template('home.html', user=user)
+    except Exception as e:
+        logger.error(f"Home route error: {str(e)}")
+        return jsonify({"status": "fail", "message": "Unable to load home page."}), 500
+
+@app.route('/features')
+def features():
+    try:
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return render_template('features.html')
+    except Exception as e:
+        logger.error(f"Features route error: {str(e)}")
+        return jsonify({"status": "fail", "message": "Unable to load features page."}), 500
+
+@app.route('/about')
+def about():
+    try:
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return render_template('about.html')
+    except Exception as e:
+        logger.error(f"About route error: {str(e)}")
+        return jsonify({"status": "fail", "message": "Unable to load about page."}), 500
+
+@app.route('/profile', methods=['GET', 'POST'])
+def profile():
+    try:
+        user_id = session.get('user_id')
+        if not user_id:
+            return redirect(url_for('index'))
+        if request.method == 'POST':
+            data = request.json
+            mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$set": data})
+            return jsonify({"status": "updated"})
+        user = mongo.db.users.find_one({"_id": ObjectId(user_id)}, {"password": 0})
+        return render_template('profile.html', user=user)
+    except Exception as e:
+        logger.error(f"Profile error: {str(e)} with data: {data}")
+        return jsonify({"status": "fail", "message": "Profile operation failed."}), 500
+
+@app.route('/summarize', methods=['POST'])
+def summarize():
+    try:
+        text = ""
+        url = request.form.get('url', '').strip()
+        files = request.files.getlist('files') if 'files' in request.files else []
+
+        if url:
+            try:
+                article = Article(url)
+                article.download()
+                article.parse()
+                text += article.text + "\n"
+            except Exception as e:
+                return jsonify({'error': f'Failed to fetch URL: {str(e)}'})
+
+        if files:
+            for file in files:
+                filename = secure_filename(file.filename)
+                if not filename.lower().endswith(('.pdf', '.doc', '.docx')):
+                    return jsonify({'error': 'Only PDF, DOC, and DOCX files are supported.'})
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                file.save(filepath)
+                if filename.lower().endswith('.pdf'):
+                    with pdfplumber.open(filepath) as pdf:
+                        text += "".join(page.extract_text() or "" for page in pdf.pages) + "\n"
+                elif filename.lower().endswith(('.doc', '.docx')):
+                    doc = docx.Document(filepath)
+                    text += "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip()) + "\n"
+
+        if not text.strip():
+            return jsonify({'error': 'No content to summarize'})
+
+        doc = nlp(text)
+        sentences = [sent.text.strip() for sent in doc.sents if len(sent.text.strip()) > 10]
+        if not sentences:
+            return jsonify({'error': 'No valid content to summarize'})
+
+        # Enhanced summarization with flow
+        keyword_weights = {token.text.lower(): token.sentiment + 0.1 for token in doc if token.is_alpha and token.pos_ in ['NOUN', 'VERB', 'ADJ'] and token.text.lower() not in nlp.Defaults.stop_words}
+        entity_weights = {ent.text.lower(): len(ent.text.split()) * 0.5 for ent in doc.ents}
+        sentence_scores = {}
+
+        for i, sent in enumerate(sentences):
+            words = sent.lower().split()
+            score = sum(keyword_weights.get(word, 0) for word in words) * 0.6 + sum(entity_weights.get(word, 0) for word in words) * 0.3
+            if i < len(sentences) * 0.1 or i > len(sentences) * 0.9:
+                score += 0.2
+            sentence_scores[i] = score / max(len(words), 1)
+
+        num_sentences = min(max(3, int(len(sentences) * 0.25)), 5)
+        top_indices = sorted(sentence_scores, key=sentence_scores.get, reverse=True)[:num_sentences]
+        summary_sentences = [sentences[i] for i in sorted(top_indices)]
+
+        # Create a flowing summary
+        summary = " ".join(summary_sentences).replace('\n', ' ').strip()
+        summary = re.sub(r'\s+', ' ', summary)  # Normalize spaces
+        summary = f"The document highlights that {summary}. It provides key insights including {', '.join(summary_sentences[:2])}. Overall, the main focus is on {summary_sentences[-1].lower().replace('.', '')}."
+
+        return jsonify({'summary': summary, 'status': 'Content processed successfully'})
+    except Exception as e:
+        logger.error(f"Summarize error: {str(e)} with url: {url}, files: {files}")
+        return jsonify({'error': f'Summarize failed: {str(e)}'}), 500
+
+@app.route('/translate', methods=['POST'])
+def translate():
+    try:
+        data = request.get_json()
+        text = data.get('text', '')
+        lang = data.get('lang', 'en')
+        supported_langs = {'en': 'English', 'hi': 'Hindi', 'kn': 'Kannada', 'ta': 'Tamil', 'te': 'Telugu', 'ur': 'Urdu'}
+        if lang not in supported_langs:
+            return jsonify({'error': 'Unsupported language'})
+        translated = GoogleTranslator(source='auto', target=lang).translate(text)
+        return jsonify({"translated": translated, "language": supported_langs[lang]})
+    except Exception as e:
+        logger.error(f"Translate error: {str(e)} with data: {data}")
+        return jsonify({'error': f'Translation failed: {str(e)}'}), 500
+
+@app.route('/speak', methods=['POST'])
+def speak():
+    try:
+        data = request.get_json()
+        text = data.get('text', '').strip()
+        lang = data.get('lang', 'en')
+        if not text:
+            return jsonify({'error': 'No text to speak'}), 400
+        audio_filename = f"speech_{uuid.uuid4().hex}.mp3"
+        audio_path = os.path.join(app.config['UPLOAD_FOLDER'], audio_filename)
+        tts = gTTS(text=text, lang=lang, tld='co.uk')
+        tts.save(audio_path)
+        logger.info(f"Audio file generated: {audio_path}")
+        return jsonify({'audio_path': f'/uploads/{audio_filename}'})
+    except Exception as e:
+        logger.error(f"Speak error: {str(e)} with data: {data}")
+        return jsonify({'error': f'Text-to-speech failed: {str(e)}'}), 500
+
+@app.route('/logout')
+def logout():
+    try:
+        session.pop('user_id', None)
+        return redirect(url_for('login'))
+    except Exception as e:
+        logger.error(f"Logout error: {str(e)}")
+        return jsonify({"status": "fail", "message": "Unable to logout."}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5001)
